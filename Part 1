@@ -1,0 +1,107 @@
+1️⃣ Identify Issues
+#	Type	Problem Description	Explanation
+1	🧱 Data Design	warehouse_id stored in Product model	A product can exist in multiple warehouses, so this violates the data relationship design. warehouse_id should belong to the Inventory table instead.
+2	⚠️ No SKU Uniqueness Validation	No check for duplicate SKU before saving	Can lead to multiple entries of the same SKU across products, breaking inventory tracking.
+3	🧩 No Input Validation	Code assumes all keys (name, sku, etc.) exist	Missing or invalid data (e.g., missing price or wrong types) will cause runtime errors (KeyError).
+4	💥 Multiple Commits Without Transaction	Two separate commits for product and inventory	If the second commit fails, product is created but inventory isn’t → inconsistent database.
+5	🔥 No Exception Handling / Rollback	No try/except block for DB operations	Server crashes on any DB error; no rollback, leaving partial data.
+6	💰 Price Precision	price might be stored as float	Floats lose precision for decimal currencies. Should use Decimal.
+7	🚫 No Validation for Negative Values	price and initial_quantity not checked for negatives	Can result in negative stock or invalid product prices.
+8	🕳 Optional Fields Not Handled	Some product fields could be optional	Missing optional values will cause KeyErrors or DB constraint issues.
+2️⃣ Explain Impact in Production
+Issue	Real-World Impact
+Wrong relationship (warehouse_id in Product)	A product can’t exist in multiple warehouses, breaking scalability and accurate inventory reports.
+Duplicate SKUs	Conflicting data during sales, shipping, or barcode scans.
+Missing validation	Crashes the API when data is incomplete or malformed.
+Multiple commits	Partial data stored — product without stock record.
+No error handling	Users get 500 errors; database integrity is lost.
+Float precision	Financial discrepancies in pricing, totals, and invoices.
+Negative values	Unrealistic stock counts or negative pricing.
+Optional fields	Prevents API from handling incomplete product info gracefully.
+ 3️⃣ Fixed & Improved Version
+from flask import Blueprint, request, jsonify
+from models import db, Product, Inventory
+from sqlalchemy.exc import IntegrityError
+from decimal import Decimal
+
+products_bp = Blueprint('products', __name__)
+
+@products_bp.route('/api/products', methods=['POST'])
+def create_product():
+    """
+    Create a new product and its initial inventory.
+    Handles validation, transactions, and SKU uniqueness.
+    """
+    data = request.get_json() or {}
+    
+    # --- Required fields ---
+    required = ['name', 'sku', 'price', 'warehouse_id', 'initial_quantity']
+    missing = [f for f in required if f not in data]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    # --- Validate SKU uniqueness ---
+    if Product.query.filter_by(sku=data['sku']).first():
+        return jsonify({"error": "SKU must be unique across the platform"}), 400
+
+    # --- Validate numeric fields ---
+    try:
+        price = Decimal(str(data['price']))
+        quantity = int(data['initial_quantity'])
+        if price < 0 or quantity < 0:
+            return jsonify({"error": "Price and quantity must be non-negative"}), 400
+    except Exception:
+        return jsonify({"error": "Invalid number format"}), 400
+
+    try:
+        # --- Atomic transaction ---
+        product = Product(
+            name=data['name'],
+            sku=data['sku'],
+            price=price,
+            description=data.get('description'),  # optional field
+            category=data.get('category')
+        )
+        db.session.add(product)
+        db.session.flush()  # get product.id before commit
+
+        inventory = Inventory(
+            product_id=product.id,
+            warehouse_id=data['warehouse_id'],
+            quantity=quantity
+        )
+        db.session.add(inventory)
+        db.session.commit()
+
+        return jsonify({
+            "message": "Product created successfully",
+            "product_id": product.id
+        }), 201
+
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"error": "Database integrity error"}), 500
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+ 4️⃣ Explanation of Fixes
+Fix	Description
+✅ Removed warehouse_id from Product	Corrects relationship — handled via Inventory.
+✅ Added validation for required fields	Prevents KeyError and enforces input completeness.
+✅ SKU uniqueness check	Prevents duplicate entries in the system.
+✅ Decimal type for price	Ensures accurate financial data.
+✅ Atomic transaction	Product and inventory created together — rollback-safe.
+✅ Exception handling	Prevents server crashes and rolls back DB state.
+✅ Optional fields (description, category)	API now accepts flexible input.
+✅ Numeric validation	Ensures realistic price and quantity.
+✅ Final Outcome
+
+Stable and safe API with full input validation
+
+Consistent database transactions (atomic operations)
+
+Supports multiple warehouses
+
+Accurate financial and inventory data
+
+Graceful error messages for clients
