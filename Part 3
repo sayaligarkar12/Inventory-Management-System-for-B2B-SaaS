@@ -1,0 +1,272 @@
+Low-stock Alerts API
+
+Endpoint: GET /api/companies/<int:company_id>/alerts/low-stock
+Language / Framework: Python 3 + Flask + SQLAlchemy
+
+Paste this into routes/alerts.py (or adapt to your app layout). I also include the minimal model-field assumptions at the top so the code is self-contained.
+
+# routes/alerts.py
+from datetime import datetime, timedelta
+from flask import Blueprint, jsonify, request
+from sqlalchemy import func, and_, literal_column
+from models import db, Product, Inventory, Warehouse, Supplier, ProductSupplier, SalesOrder, SalesOrderItem
+
+alerts_bp = Blueprint('alerts', __name__)
+
+# --- CONFIG / TUNABLES ---
+RECENT_DAYS_DEFAULT = 90       # how far back to consider "recent sales"
+MIN_DAYS_FOR_AVG = 1           # avoid div-by-zero (use RECENT_DAYS_DEFAULT instead)
+PRODUCT_TYPE_THRESHOLDS = {    # fallback thresholds by product_type if product.default_reorder_threshold is NULL
+    'standard': 20,
+    'perishable': 50,
+    'electronic': 10,
+    'bundle': 5
+}
+
+
+@alerts_bp.route('/api/companies/<int:company_id>/alerts/low-stock', methods=['GET'])
+def low_stock_alerts(company_id):
+    """
+    Returns low-stock alerts for a company.
+    Business rules implemented:
+      - Threshold: inventory.safety_stock if set, else product.default_reorder_threshold,
+        else fallback by product_type, else global default.
+      - Only include product+warehouse pairs that had recent sales in RECENT_DAYS.
+      - Include supplier info (primary supplier if exists, else best candidate).
+      - Compute days_until_stockout = current_stock / avg_daily_sales (based on recent window).
+    """
+    # Allow overriding recent window via query param for testing
+    recent_days = int(request.args.get('recent_days', RECENT_DAYS_DEFAULT))
+    recent_since = datetime.utcnow() - timedelta(days=recent_days)
+
+    # 1) Get warehouses for company
+    warehouse_ids_q = db.session.query(Warehouse.id).filter(Warehouse.company_id == company_id).subquery()
+
+    # 2) Compute qty sold per product per warehouse in recent window
+    # Join SalesOrder -> SalesOrderItem, filter by company & date
+    sales_agg = (
+        db.session.query(
+            SalesOrderItem.product_id.label('product_id'),
+            SalesOrder.warehouse_id.label('warehouse_id'),
+            func.coalesce(func.sum(SalesOrderItem.quantity), 0).label('qty_sold')
+        )
+        .join(SalesOrder, SalesOrder.id == SalesOrderItem.sales_order_id)
+        .filter(
+            SalesOrder.company_id == company_id,
+            SalesOrder.created_at >= recent_since,
+            SalesOrder.warehouse_id.in_(warehouse_ids_q)
+        )
+        .group_by(SalesOrderItem.product_id, SalesOrder.warehouse_id)
+        .subquery()
+    )
+
+    # 3) Base inventory + product data for warehouses of this company
+    base_q = (
+        db.session.query(
+            Inventory.id.label('inventory_id'),
+            Inventory.product_id.label('product_id'),
+            Inventory.warehouse_id.label('warehouse_id'),
+            Inventory.quantity.label('current_stock'),
+            Inventory.safety_stock.label('safety_stock'),
+            Product.name.label('product_name'),
+            Product.sku.label('sku'),
+            Product.product_type.label('product_type'),
+            Product.default_reorder_threshold.label('product_threshold')
+        )
+        .join(Product, Product.id == Inventory.product_id)
+        .filter(Inventory.warehouse_id.in_(warehouse_ids_q))
+        .subquery()
+    )
+
+    # 4) Join inventory with sales aggregate (left join) to get qty_sold
+    joined = (
+        db.session.query(
+            base_q.c.product_id,
+            base_q.c.product_name,
+            base_q.c.sku,
+            base_q.c.warehouse_id,
+            base_q.c.current_stock,
+            base_q.c.safety_stock,
+            base_q.c.product_type,
+            base_q.c.product_threshold,
+            func.coalesce(sales_agg.c.qty_sold, 0).label('qty_sold')
+        )
+        .outerjoin(sales_agg, and_(
+            sales_agg.c.product_id == base_q.c.product_id,
+            sales_agg.c.warehouse_id == base_q.c.warehouse_id
+        ))
+    )
+
+    alerts = []
+
+    # We'll collect product_ids and warehouse_ids to batch-retrieve suppliers after
+    pairs_to_check = []
+
+    # 5) Iterate rows and apply business logic
+    for row in joined:
+        # Only alert for product+warehouse pairs with recent sales activity
+        if row.qty_sold is None or row.qty_sold <= 0:
+            continue
+
+        # Determine threshold:
+        # priority: inventory.safety_stock -> product.default_reorder_threshold -> product_type fallback -> global fallback
+        if row.safety_stock is not None:
+            threshold = int(row.safety_stock)
+        elif row.product_threshold is not None:
+            threshold = int(row.product_threshold)
+        else:
+            threshold = PRODUCT_TYPE_THRESHOLDS.get(row.product_type, PRODUCT_TYPE_THRESHOLDS['standard'])
+
+        # Alert if current stock below threshold
+        if row.current_stock < threshold:
+            # Average daily sales in recent window
+            avg_daily_sales = row.qty_sold / max(recent_days, MIN_DAYS_FOR_AVG)
+            days_until_stockout = None
+            if avg_daily_sales > 0:
+                days_until_stockout = int(row.current_stock / avg_daily_sales)
+
+            alerts.append({
+                'product_id': row.product_id,
+                'product_name': row.product_name,
+                'sku': row.sku,
+                'warehouse_id': row.warehouse_id,
+                'warehouse_name': None,  # fill later
+                'current_stock': int(row.current_stock),
+                'threshold': int(threshold),
+                'days_until_stockout': days_until_stockout,
+                'supplier': None  # fill later
+            })
+            pairs_to_check.append((row.product_id, row.warehouse_id))
+
+    if not alerts:
+        return jsonify({'alerts': [], 'total_alerts': 0})
+
+    # 6) Batch fetch warehouse names
+    # build mapping warehouse_id -> name
+    warehouse_ids = list({p[1] for p in pairs_to_check})
+    warehouses = db.session.query(Warehouse.id, Warehouse.name).filter(Warehouse.id.in_(warehouse_ids)).all()
+    wh_map = {w.id: w.name for w in warehouses}
+
+    # 7) For each product, find preferred supplier info
+    # Strategy: prefer ProductSupplier.is_primary, else minimum lead_time_days, else first supplier
+    product_ids = list({p[0] for p in pairs_to_check})
+    ps_subq = (
+        db.session.query(
+            ProductSupplier.product_id.label('product_id'),
+            ProductSupplier.supplier_id.label('supplier_id'),
+            ProductSupplier.is_primary.label('is_primary'),
+            ProductSupplier.lead_time_days.label('lead_time_days')
+        )
+        .filter(ProductSupplier.product_id.in_(product_ids))
+        .subquery()
+    )
+    supps_q = (
+        db.session.query(
+            ps_subq.c.product_id,
+            Supplier.id.label('supplier_id'),
+            Supplier.name.label('supplier_name'),
+            Supplier.contact_email.label('contact_email'),
+            ps_subq.c.is_primary,
+            ps_subq.c.lead_time_days
+        )
+        .join(Supplier, Supplier.id == ps_subq.c.supplier_id)
+    ).all()
+
+    # Build best supplier per product (in-memory selection)
+    best_supplier_by_product = {}
+    for r in supps_q:
+        pid = r.product_id
+        candidate = {
+            'id': r.supplier_id,
+            'name': r.supplier_name,
+            'contact_email': r.contact_email,
+            'is_primary': bool(r.is_primary),
+            'lead_time_days': r.lead_time_days if r.lead_time_days is not None else 9999
+        }
+        if pid not in best_supplier_by_product:
+            best_supplier_by_product[pid] = candidate
+            continue
+        # prefer primary
+        current = best_supplier_by_product[pid]
+        if candidate['is_primary'] and not current['is_primary']:
+            best_supplier_by_product[pid] = candidate
+        else:
+            # choose lower lead_time
+            if candidate['lead_time_days'] < current['lead_time_days']:
+                best_supplier_by_product[pid] = candidate
+
+    # 8) Fill in warehouse names and supplier info in alerts
+    for a in alerts:
+        a['warehouse_name'] = wh_map.get(a['warehouse_id'])
+        supplier = best_supplier_by_product.get(a['product_id'])
+        if supplier:
+            a['supplier'] = {
+                'id': supplier['id'],
+                'name': supplier['name'],
+                'contact_email': supplier['contact_email']
+            }
+        else:
+            a['supplier'] = None
+
+    return jsonify({'alerts': alerts, 'total_alerts': len(alerts)})
+
+
+Assumptions (explicit)
+
+Schema fields present:
+
+Product has: id, name, sku, product_type, default_reorder_threshold (nullable).
+
+Inventory has: id, product_id, warehouse_id, quantity, safety_stock (nullable).
+
+Supplier has: id, name, contact_email.
+
+ProductSupplier (mapping) has: product_id, supplier_id, is_primary (bool), lead_time_days (nullable).
+
+SalesOrder has: id, company_id, warehouse_id, created_at.
+
+SalesOrderItem has: id, sales_order_id, product_id, quantity.
+
+RECENT_DAYS = 90 by default (configurable via query param).
+
+Threshold precedence: inventory.safety_stock → product.default_reorder_threshold → PRODUCT_TYPE_THRESHOLDS[product_type] → global fallback.
+
+Only product+warehouse pairs with qty_sold > 0 in the recent window are considered.
+
+Supplier selection: prefer is_primary True; if none, choose smallest lead_time_days; tie-breaker arbitrary.
+
+Days until stockout uses simple avg daily sales: qty_sold / recent_days. This is a simple model (no seasonality or weighted smoothing).
+
+Edge Cases & How They’re Handled
+
+No warehouses for company → returns empty alerts.
+
+Products with zero recent sales → skipped (per rule).
+
+Missing supplier → supplier in response is null, signaling manual intervention.
+
+Very low average sales → days_until_stockout could be very large; we compute as integer and return it (can be None if avg == 0).
+
+Division by zero → protected by max(recent_days, 1).
+
+Large datasets → aggregated on DB side for sales; but we still transfer some rows into Python for supplier selection. For very large scales, this should be fully done in SQL or background jobs.
+
+Concurrent inventory changes → alert is a snapshot; consumers should re-check before running any critical replenishment action.
+
+Performance & Scaling Notes (production readiness)
+
+Important indexes:
+
+sales_orders (company_id, created_at) and sales_order_items (product_id, sales_order_id) for fast sales aggregation.
+
+inventories (warehouse_id, product_id, quantity) and products (product_type, default_reorder_threshold).
+
+product_suppliers (product_id, is_primary, lead_time_days) for efficient supplier lookups.
+
+Pre-aggregation: For large datasets, compute daily product sales per warehouse in a rolling window and store in a materialized view or analytics table. Query that table rather than raw sales_order_items each request.
+
+Pagination: Add pagination if alerts can be large (e.g., ?page=1&per_page=50).
+
+Caching: Alerts can be cached or updated by a background scheduler (e.g., compute nightly or every N minutes), return cached results to API consumers.
+
+Monitoring: Track query latencies and add rate limiting.
