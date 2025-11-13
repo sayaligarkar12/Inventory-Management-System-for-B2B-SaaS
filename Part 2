@@ -1,0 +1,148 @@
+Part 2: Database Design – “StockFlow” Inventory Management System
+1️⃣ Database Schema Overview
+
+Below is the proposed relational schema for the B2B inventory platform.
+
+Core Entities & Relationships
+
+-- Company table: each business using StockFlow
+CREATE TABLE companies (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) UNIQUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Warehouses belong to a company
+CREATE TABLE warehouses (
+    id SERIAL PRIMARY KEY,
+    company_id INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    location VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Suppliers provide products to companies
+CREATE TABLE suppliers (
+    id SERIAL PRIMARY KEY,
+    company_id INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    contact_email VARCHAR(255),
+    phone VARCHAR(50)
+);
+
+-- Product master data
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    company_id INT NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    sku VARCHAR(100) UNIQUE NOT NULL,
+    price DECIMAL(10,2) CHECK (price >= 0),
+    category VARCHAR(100),
+    description TEXT,
+    product_type VARCHAR(50) DEFAULT 'single' CHECK (product_type IN ('single','bundle')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Inventory per product per warehouse
+CREATE TABLE inventories (
+    id SERIAL PRIMARY KEY,
+    product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    warehouse_id INT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+    quantity INT DEFAULT 0 CHECK (quantity >= 0),
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (product_id, warehouse_id)
+);
+
+-- Supplier–Product mapping (many-to-many)
+CREATE TABLE supplier_products (
+    supplier_id INT NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
+    product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    PRIMARY KEY (supplier_id, product_id)
+);
+
+-- Track inventory changes (auditing / stock movement)
+CREATE TABLE inventory_transactions (
+    id SERIAL PRIMARY KEY,
+    product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    warehouse_id INT NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+    change_type VARCHAR(50) CHECK (change_type IN ('sale','restock','transfer','adjustment')),
+    quantity_change INT NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Bundles: relationship between bundle product and its child products
+CREATE TABLE product_bundles (
+    bundle_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    component_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    quantity INT DEFAULT 1 CHECK (quantity > 0),
+    PRIMARY KEY (bundle_id, component_id)
+);
+
+
+| **Entity**                 | **Purpose**                                     | **Key Points / Constraints**                                       |
+| -------------------------- | ----------------------------------------------- | ------------------------------------------------------------------ |
+| **companies**              | Represents each B2B client using StockFlow      | Enables multi-tenant design                                        |
+| **warehouses**             | Physical storage under a company                | Linked via `company_id`                                            |
+| **products**               | Master catalog entry                            | SKU unique globally per company; supports “bundle” products        |
+| **inventories**            | Tracks per-warehouse stock                      | `UNIQUE(product_id, warehouse_id)` ensures one record per location |
+| **suppliers**              | Vendors providing stock                         | Mapped via `supplier_products`                                     |
+| **inventory_transactions** | Auditing table                                  | Historical log of every inventory movement                         |
+| **product_bundles**        | Many-to-many self-relation for bundled products | Enables nested/bundle composition                                  |
+
+
+3️⃣ Design Decisions
+a. Normalization & Scalability
+
+All major entities are normalized to 3NF, preventing data duplication.
+
+Multi-tenant approach (each record linked to a company_id) allows clean data separation.
+
+b. Constraints & Indexes
+
+Unique Indexes: products.sku and (product_id, warehouse_id) prevent duplicates.
+
+Foreign Keys: Enforce referential integrity between entities.
+
+Check Constraints: Prevent negative stock or prices.
+
+Indexes:
+
+CREATE INDEX idx_inventory_product ON inventories(product_id);
+
+CREATE INDEX idx_transactions_timestamp ON inventory_transactions(created_at);
+
+c. Decimal for Price
+
+Financial fields use DECIMAL(10,2) instead of FLOAT to avoid rounding issues.
+
+d. Historical Tracking
+
+inventory_transactions allows stock history and analytics (e.g., sales rate, stock movement).
+
+e. Bundled Products
+
+product_bundles supports nested product structures (bundle of items).
+Example: A “Starter Kit” bundle may contain 2 batteries and 1 charger.
+
+❓ 4️⃣ Missing / Clarifying Questions for Product Team
+Topic	Question	Reason
+SKU uniqueness	Should SKU be unique globally or per company?	Impacts indexing strategy
+Low stock threshold	Where is threshold stored — in product table or configurable per warehouse?	Needed for alerts
+Inventory transactions	Do we need to store user info who triggered the change?	Useful for audit logs
+Bundles	Can bundles contain other bundles (nested bundles)?	Impacts recursion logic
+Suppliers	Can one product have multiple suppliers? If so, is there a preferred supplier?	Needed for reordering
+Currency	Should price be in a single currency or multi-currency support per company?	Affects financial accuracy
+Soft deletes	Should deleted products remain in history?	Needed for audit compliance
+Sales activity tracking	Where do sales orders or invoices live?	Required for “recent sales” alerts in Part 3
+Stock reservations	Do we track reserved (allocated) stock vs. available?	Important for fulfillment accuracy
+🧩 5️⃣ Example ERD (Entity Relationship Description)
+
+Company ⟶ (1-N) Warehouses
+Company ⟶ (1-N) Products
+Product ⟷ (M-N) Suppliers (via supplier_products)
+Product ⟶ (1-N) Inventories (each warehouse has its own quantity)
+Product ⟶ (1-N) InventoryTransactions
+Product ⟷ (M-N) ProductBundles (bundle relationship)
+
